@@ -68,12 +68,14 @@ def merge_window_outputs(
         key=lambda item: (item["schema_path"], -(item.get("confidence") or 0)),
     )
 
+    final_output = build_final_output(extracted_fields)
     return {
         "page_classifications": [
             page_classifications[page_number] for page_number in sorted(page_classifications)
         ],
         "extracted_fields": extracted_fields,
-        "final_output": build_final_output(extracted_fields),
+        "final_output": final_output,
+        "final_extraction": build_final_extraction(final_output),
     }
 
 
@@ -84,6 +86,22 @@ def build_final_output(extracted_fields: list[dict[str, Any]]) -> dict[str, Any]
     compacted_output = _compact_sparse_arrays(final_output)
     _normalize_invoice_line_items(compacted_output)
     return compacted_output
+
+
+def build_final_extraction(final_output: Any) -> Any:
+    if isinstance(final_output, dict) and "value" in final_output and "citations" in final_output:
+        return final_output.get("value")
+
+    if isinstance(final_output, dict):
+        return {
+            key: build_final_extraction(value)
+            for key, value in final_output.items()
+        }
+
+    if isinstance(final_output, list):
+        return [build_final_extraction(item) for item in final_output]
+
+    return final_output
 
 
 def _evidence_value(field: dict[str, Any]) -> dict[str, Any]:

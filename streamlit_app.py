@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import json
 import os
 from typing import Any
 
@@ -49,6 +50,19 @@ def flatten_final_output(value: Any, path: str = "") -> list[dict[str, Any]]:
         rows.append({"path": path, "value": value, "confidence": None, "citations": []})
 
     return rows
+
+
+def direct_values(value: Any) -> Any:
+    if is_leaf_value(value):
+        return value.get("value")
+
+    if isinstance(value, dict):
+        return {key: direct_values(child) for key, child in value.items()}
+
+    if isinstance(value, list):
+        return [direct_values(child) for child in value]
+
+    return value
 
 
 def collect_page_classifications(
@@ -544,3 +558,15 @@ with right:
         zoom=zoom,
     )
     st.image(rendered_page, use_container_width=True)
+
+st.divider()
+st.subheader("Final Extraction Results")
+st.caption("Direct schema values only. Coordinates, confidence, and citations are excluded.")
+st.code(
+    json.dumps(
+        extraction.get("final_extraction") or direct_values(extraction.get("final_output", {})),
+        indent=2,
+        ensure_ascii=False,
+    ),
+    language="json",
+)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.schemas.claim_fields import ClaimType
-from app.services.extraction_merge import build_final_output
+from app.services.extraction_merge import build_final_extraction, build_final_output
 from app.services.gemini_extraction import GeminiExtractionClient
 
 
@@ -61,10 +61,12 @@ def enrich_dpc_details(
         ),
     ]
 
+    final_output = build_final_output(enriched_fields)
     enriched_merged = {
         **merged,
         "extracted_fields": enriched_fields,
-        "final_output": build_final_output(enriched_fields),
+        "final_output": final_output,
+        "final_extraction": build_final_extraction(final_output),
     }
     return {
         "merged": enriched_merged,
