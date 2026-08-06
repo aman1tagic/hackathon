@@ -1,0 +1,24 @@
+[project]
+name = "claims-hackathon"
+version = "0.1.0"
+description = "OCR-powered medical adjudication assistant prototype"
+requires-python = ">=3.11"
+dependencies = [
+    "azure-ai-formrecognizer>=3.3.3,<4.0.0",
+    "certifi>=2026.0.0",
+    "fastapi>=0.116.0,<1.0.0",
+    "pypdf>=5.0.0,<6.0.0",
+    "python-multipart>=0.0.20,<1.0.0",
+    "pillow>=11.0.0,<12.0.0",
+    "pymupdf>=1.26.0,<2.0.0",
+    "requests>=2.32.0,<3.0.0",
+    "streamlit>=1.50.0,<2.0.0",
+    "uvicorn[standard]>=0.35.0,<1.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
