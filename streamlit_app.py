@@ -16,6 +16,26 @@ DEFAULT_API_BASE_URL = os.getenv("CLAIMS_API_BASE_URL", "http://127.0.0.1:8001")
 
 st.set_page_config(page_title="Claims MA Review", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    .block-container {
+        max-width: 1800px;
+        padding-top: 1.25rem;
+    }
+    div[data-testid="stMetric"] {
+        background: rgba(127, 127, 127, 0.08);
+        border-radius: 8px;
+        padding: 0.75rem 0.9rem;
+    }
+    div[data-testid="stExpander"] details {
+        border-radius: 8px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def is_leaf_value(value: Any) -> bool:
     return isinstance(value, dict) and "value" in value and "citations" in value
@@ -200,6 +220,108 @@ def truncate(value: Any, max_length: int = 110) -> str:
     if len(text) <= max_length:
         return text
     return text[: max_length - 3] + "..."
+
+
+def count_leaf_values(value: Any) -> int:
+    if is_leaf_value(value):
+        return 1
+    if isinstance(value, dict):
+        return sum(count_leaf_values(child) for child in value.values())
+    if isinstance(value, list):
+        return sum(count_leaf_values(child) for child in value)
+    return 1 if value not in (None, "", [], {}) else 0
+
+
+def list_item_label(index: int, item: Any) -> str:
+    if isinstance(item, dict):
+        for key in ("itemDescription", "invoiceNumber", "diagnosisName", "diseaseName"):
+            value = item.get(key)
+            if is_leaf_value(value):
+                return f"{index}. {truncate(value.get('value'), 48)}"
+        return f"{index}. {count_leaf_values(item)} fields"
+    return f"{index}. {truncate(item, 48)}"
+
+
+def render_field_row(path: str, label: str, value: dict[str, Any]) -> None:
+    citations = value.get("citations") or []
+    confidence = value.get("confidence")
+    cols = st.columns([0.34, 0.42, 0.09, 0.15])
+    cols[0].markdown(f"**{label}**")
+    cols[0].caption(path)
+    cols[1].write(truncate(value.get("value"), 150))
+    cols[2].write("" if confidence is None else f"{confidence:.2f}")
+    if cols[3].button(
+        "Go",
+        key=f"tree-field-{path}",
+        disabled=not citations,
+        use_container_width=True,
+    ):
+        st.session_state["selected_field"] = {
+            "path": path,
+            "value": value.get("value"),
+            "confidence": confidence,
+            "citations": citations,
+        }
+        first_page = citations[0].get("page_number", 1)
+        st.session_state["page_number"] = first_page
+        st.rerun()
+
+
+def render_field_tree(value: Any, path: str = "", depth: int = 0) -> None:
+    if is_leaf_value(value):
+        render_field_row(path=path, label=path.split(".")[-1] or path, value=value)
+        return
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else key
+            if is_leaf_value(child):
+                render_field_row(path=child_path, label=key, value=child)
+            elif depth == 0:
+                leaf_count = count_leaf_values(child)
+                with st.expander(f"{key} ({leaf_count})", expanded=False):
+                    render_field_tree(child, child_path, depth + 1)
+            else:
+                leaf_count = count_leaf_values(child)
+                st.markdown(f"**{key}** · {leaf_count} fields")
+                render_field_tree(child, child_path, depth + 1)
+        return
+
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            child_path = f"{path}[{index}]"
+            if is_leaf_value(child):
+                render_field_row(path=child_path, label=str(index), value=child)
+            elif depth == 0:
+                with st.expander(list_item_label(index, child), expanded=False):
+                    render_field_tree(child, child_path, depth + 1)
+            else:
+                st.markdown(f"**{list_item_label(index, child)}**")
+                render_field_tree(child, child_path, depth + 1)
+        return
+
+    if path:
+        st.write(f"**{path}**: {value}")
+
+
+def render_flat_field_rows(filtered_rows: list[dict[str, Any]]) -> None:
+    for index, row in enumerate(filtered_rows):
+        citations = row.get("citations") or []
+        cols = st.columns([0.48, 0.28, 0.09, 0.15])
+        cols[0].markdown(f"**{row['path']}**")
+        cols[1].write(truncate(row["value"]))
+        confidence = row.get("confidence")
+        cols[2].write("" if confidence is None else f"{confidence:.2f}")
+        if cols[3].button(
+            "Go",
+            key=f"field-{index}-{row['path']}",
+            disabled=not citations,
+            use_container_width=True,
+        ):
+            st.session_state["selected_field"] = row
+            first_page = citations[0].get("page_number", 1)
+            st.session_state["page_number"] = first_page
+            st.rerun()
 
 
 def is_pdf_file(filename: str | None, content_type: str | None) -> bool:
@@ -431,10 +553,8 @@ summary_cols[1].metric("Document groups", len(document_groups))
 summary_cols[2].metric("Fields", len(field_rows))
 summary_cols[3].metric("Windows", extraction.get("window_count", 0))
 
-left, right = st.columns([0.48, 0.52], gap="large")
-
-with left:
-    st.subheader("Page Classification")
+st.subheader("Page Classification")
+with st.container(height=240, border=True):
     if document_groups:
         st.dataframe(
             [
@@ -456,7 +576,10 @@ with left:
     else:
         st.warning("No page classifications returned.")
 
-    st.subheader("Final Structured Values")
+left, right = st.columns([0.48, 0.52], gap="large")
+
+with left:
+    st.subheader("Extracted Fields")
     search = st.text_input("Filter fields", placeholder="invoice, diagnosis, account...")
     normalized_search = search.lower().strip()
     filtered_rows = [
@@ -467,97 +590,110 @@ with left:
         or normalized_search in str(row["value"]).lower()
     ]
 
-    st.caption(f"Showing {len(filtered_rows)} of {len(field_rows)} extracted values.")
-    for index, row in enumerate(filtered_rows):
-        citations = row.get("citations") or []
-        cols = st.columns([0.48, 0.28, 0.09, 0.15])
-        cols[0].markdown(f"**{row['path']}**")
-        cols[1].write(truncate(row["value"]))
-        confidence = row.get("confidence")
-        cols[2].write("" if confidence is None else f"{confidence:.2f}")
-        if cols[3].button(
-            "Go",
-            key=f"field-{index}-{row['path']}",
-            disabled=not citations,
-            use_container_width=True,
-        ):
-            st.session_state["selected_field"] = row
-            first_page = citations[0].get("page_number", 1)
-            st.session_state["page_number"] = first_page
-            st.rerun()
+    if normalized_search:
+        st.caption(f"Showing {len(filtered_rows)} of {len(field_rows)} matching values.")
+    else:
+        st.caption(f"Showing {len(field_rows)} values in collapsible schema hierarchy.")
 
-    with st.expander("Full API response JSON"):
-        st.json(result)
+    with st.container(height=780, border=True):
+        if normalized_search:
+            render_flat_field_rows(filtered_rows)
+        else:
+            render_field_tree(extraction.get("final_output", {}))
 
 with right:
     st.subheader("Document Citation Viewer")
-    if not uploaded_documents:
-        st.warning("Uploaded document bytes are not available. Re-upload and rerun extraction.")
-        st.stop()
-
-    citations = selected_citations()
-    source_location = selected_source_location()
-    if source_location is None:
-        source_location = {
-            "document_index": 0,
-            "filename": uploaded_documents[0]["filename"],
-            "source_page_number": 1,
-            "global_page_number": 1,
-        }
-
-    document_index = source_location.get("document_index")
-    document = get_uploaded_document(document_index)
-    if document is None:
-        st.warning("The cited source document is not available. Re-upload and rerun extraction.")
-        st.stop()
-
-    total_document_pages = page_count_for_document(document)
-    source_page_number = st.number_input(
-        "Original file page",
-        min_value=1,
-        max_value=max(total_document_pages, 1),
-        value=max(1, min(int(source_location.get("source_page_number") or 1), total_document_pages)),
-        step=1,
-    )
-    st.session_state["page_number"] = source_location.get("global_page_number") or selected_page()
-    zoom = st.slider("Zoom", min_value=1.0, max_value=3.0, value=1.6, step=0.1)
-    visible_citations = citations_for_source_page(citations, document_index, source_page_number)
-
-    selected = st.session_state.get("selected_field")
-    if selected:
-        st.markdown(f"**Selected field:** `{selected['path']}`")
-        st.write(truncate(selected["value"], 180))
-        st.caption(
-            f"Source: `{document.get('filename')}`"
-            f", file page {source_page_number}"
-            f", global page {source_location.get('global_page_number') or '-'}"
-        )
-        if citations:
-            st.caption(
-                "Highlighting "
-                f"{len(visible_citations)} citation(s) on this original file page."
-            )
-            with st.expander("Citation text"):
-                for citation in visible_citations:
-                    st.write(
-                        f"Global page {citation.get('page_number')}, "
-                        f"line {citation.get('line_index')}: "
-                        f"{citation.get('text', '')}"
-                    )
+    with st.container(height=860, border=True):
+        if not uploaded_documents:
+            st.warning("Uploaded document bytes are not available. Re-upload and rerun extraction.")
         else:
-            st.info("The selected field does not have citation coordinates.")
-    else:
-        st.info("Click `Go` beside an extracted value to jump to its citation.")
+            citations = selected_citations()
+            source_location = selected_source_location()
+            if source_location is None:
+                source_location = {
+                    "document_index": 0,
+                    "filename": uploaded_documents[0]["filename"],
+                    "source_page_number": 1,
+                    "global_page_number": 1,
+                }
 
-    rendered_page = render_document_page(
-        document_bytes=document["bytes"],
-        filename=document.get("filename"),
-        content_type=document.get("content_type"),
-        source_page_number=source_page_number,
-        citations=visible_citations,
-        zoom=zoom,
-    )
-    st.image(rendered_page, use_container_width=True)
+            document_index = source_location.get("document_index")
+            document = get_uploaded_document(document_index)
+            if document is None:
+                st.warning("The cited source document is not available. Re-upload and rerun extraction.")
+            else:
+                total_document_pages = page_count_for_document(document)
+                source_page_number = st.number_input(
+                    "Original file page",
+                    min_value=1,
+                    max_value=max(total_document_pages, 1),
+                    value=max(
+                        1,
+                        min(
+                            int(source_location.get("source_page_number") or 1),
+                            total_document_pages,
+                        ),
+                    ),
+                    step=1,
+                    key=(
+                        "source-page-"
+                        f"{document_index}-{source_location.get('global_page_number')}"
+                    ),
+                )
+                st.session_state["page_number"] = (
+                    source_location.get("global_page_number") or selected_page()
+                )
+                zoom = st.slider(
+                    "Zoom",
+                    min_value=1.0,
+                    max_value=3.0,
+                    value=1.6,
+                    step=0.1,
+                )
+                visible_citations = citations_for_source_page(
+                    citations,
+                    document_index,
+                    source_page_number,
+                )
+
+                selected = st.session_state.get("selected_field")
+                if selected:
+                    st.markdown(f"**Selected field:** `{selected['path']}`")
+                    st.write(truncate(selected["value"], 180))
+                    st.caption(
+                        f"Source: `{document.get('filename')}`"
+                        f", file page {source_page_number}"
+                        f", global page {source_location.get('global_page_number') or '-'}"
+                    )
+                    if citations:
+                        st.caption(
+                            "Highlighting "
+                            f"{len(visible_citations)} citation(s) on this original file page."
+                        )
+                        with st.expander("Citation text"):
+                            for citation in visible_citations:
+                                st.write(
+                                    f"Global page {citation.get('page_number')}, "
+                                    f"line {citation.get('line_index')}: "
+                                    f"{citation.get('text', '')}"
+                                )
+                    else:
+                        st.info("The selected field does not have citation coordinates.")
+                else:
+                    st.info("Click `Go` beside an extracted value to jump to its citation.")
+
+                rendered_page = render_document_page(
+                    document_bytes=document["bytes"],
+                    filename=document.get("filename"),
+                    content_type=document.get("content_type"),
+                    source_page_number=source_page_number,
+                    citations=visible_citations,
+                    zoom=zoom,
+                )
+                st.image(rendered_page, use_container_width=True)
+
+with st.expander("Full API response JSON"):
+    st.json(result)
 
 st.divider()
 st.subheader("Final Extraction Results")
