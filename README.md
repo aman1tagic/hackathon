@@ -162,6 +162,17 @@ curl -X POST http://127.0.0.1:8000/api/v1/claims/extract \
   -F "documents=@/path/to/claim-bundle.pdf"
 ```
 
+Multiple PDFs/images:
+
+```bash
+curl -X POST http://127.0.0.1:8001/api/v1/claims/extract \
+  -F "claim_type=reimbursement" \
+  -F "claim_id=CLAIM-001" \
+  -F "documents=@/path/to/claim-form.pdf" \
+  -F "documents=@/path/to/bill-page.jpg" \
+  -F "documents=@/path/to/report.png"
+```
+
 Extraction response shape:
 
 ```json

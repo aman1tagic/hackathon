@@ -94,16 +94,33 @@ def complete_page_classifications(
         total_pages = ocr.get("total_pages") or 0
         page_numbers = list(range(1, total_pages + 1))
 
-    return [
-        best_by_page.get(page_number)
-        or {
-            "page_number": page_number,
-            "document_type": "Unclassified",
-            "confidence": 0,
-            "reason": "No classification was returned for this OCR page.",
+    page_metadata_by_number = {
+        page.get("page_number"): {
+            "page_number": page.get("page_number"),
+            "document_index": page.get("document_index"),
+            "filename": page.get("filename"),
+            "source_page_number": page.get("source_page_number"),
         }
-        for page_number in page_numbers
-    ]
+        for page in ocr_pages
+        if isinstance(page.get("page_number"), int)
+    }
+
+    completed = []
+    for page_number in page_numbers:
+        metadata = page_metadata_by_number.get(page_number, {"page_number": page_number})
+        classification = best_by_page.get(page_number)
+        if classification:
+            completed.append({**classification, **metadata})
+        else:
+            completed.append(
+                {
+                    **metadata,
+                    "document_type": "Unclassified",
+                    "confidence": 0,
+                    "reason": "No classification was returned for this OCR page.",
+                }
+            )
+    return completed
 
 
 def group_page_classifications(
@@ -120,14 +137,25 @@ def group_page_classifications(
 
         confidence = classification.get("confidence")
         normalized_confidence = confidence if isinstance(confidence, (int, float)) else 0
+        document_index = classification.get("document_index")
+        source_page_number = classification.get("source_page_number")
+        filename = classification.get("filename")
         current_group = groups[-1] if groups else None
 
         if (
             current_group
             and current_group["document_type"] == document_type
+            and current_group.get("document_index") == document_index
             and current_group["end_page"] == page_number - 1
+            and (
+                not isinstance(source_page_number, int)
+                or current_group.get("end_source_page") == source_page_number - 1
+            )
         ):
             current_group["pages"].append(page_number)
+            if isinstance(source_page_number, int):
+                current_group["source_pages"].append(source_page_number)
+                current_group["end_source_page"] = source_page_number
             current_group["end_page"] = page_number
             current_group["confidence"] = min(
                 current_group["confidence"],
@@ -138,9 +166,14 @@ def group_page_classifications(
         groups.append(
             {
                 "document_type": document_type,
+                "document_index": document_index,
+                "filename": filename,
                 "start_page": page_number,
                 "end_page": page_number,
+                "start_source_page": source_page_number,
+                "end_source_page": source_page_number,
                 "pages": [page_number],
+                "source_pages": [source_page_number] if isinstance(source_page_number, int) else [],
                 "confidence": normalized_confidence,
             }
         )
@@ -155,23 +188,39 @@ def truncate(value: Any, max_length: int = 110) -> str:
     return text[: max_length - 3] + "..."
 
 
-def render_pdf_page(
-    pdf_bytes: bytes,
-    page_number: int,
+def is_pdf_file(filename: str | None, content_type: str | None) -> bool:
+    return content_type == "application/pdf" or bool(
+        filename and filename.lower().endswith(".pdf")
+    )
+
+
+def render_document_page(
+    document_bytes: bytes,
+    filename: str | None,
+    content_type: str | None,
+    source_page_number: int,
     citations: list[dict[str, Any]],
     zoom: float,
 ) -> Image.Image:
-    document = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page_index = max(0, min(page_number - 1, document.page_count - 1))
-    page = document.load_page(page_index)
-    pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-    image = Image.open(BytesIO(pixmap.tobytes("png"))).convert("RGBA")
+    if is_pdf_file(filename, content_type):
+        document = fitz.open(stream=document_bytes, filetype="pdf")
+        page_index = max(0, min(source_page_number - 1, document.page_count - 1))
+        page = document.load_page(page_index)
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        image = Image.open(BytesIO(pixmap.tobytes("png"))).convert("RGBA")
+    else:
+        image = Image.open(BytesIO(document_bytes)).convert("RGBA")
+        if zoom != 1:
+            image = image.resize(
+                (int(image.width * zoom), int(image.height * zoom)),
+                Image.Resampling.LANCZOS,
+            )
 
     overlay = Image.new("RGBA", image.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
 
     for citation in citations:
-        if citation.get("page_number") != page_number:
+        if citation.get("source_page_number") != source_page_number:
             continue
 
         polygon = citation.get("polygon") or []
@@ -201,23 +250,23 @@ def call_extract_api(
     api_base_url: str,
     claim_type: str,
     claim_id: str,
-    uploaded_filename: str,
-    uploaded_file_type: str,
-    pdf_bytes: bytes,
+    uploaded_documents: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    files = [
+        (
+            "documents",
+            (
+                document["filename"],
+                document["bytes"],
+                document.get("content_type") or "application/octet-stream",
+            ),
+        )
+        for document in uploaded_documents
+    ]
     response = requests.post(
         f"{api_base_url.rstrip('/')}/api/v1/claims/extract",
         data={"claim_type": claim_type, "claim_id": claim_id},
-        files=[
-            (
-                "documents",
-                (
-                    uploaded_filename,
-                    pdf_bytes,
-                    uploaded_file_type or "application/pdf",
-                ),
-            )
-        ],
+        files=files,
         timeout=900,
     )
     response.raise_for_status()
@@ -240,6 +289,58 @@ def selected_page(default_page: int = 1) -> int:
     return st.session_state.get("page_number", default_page)
 
 
+def selected_source_location() -> dict[str, Any] | None:
+    citations = selected_citations()
+    if citations:
+        citation = citations[0]
+        return {
+            "document_index": citation.get("document_index"),
+            "filename": citation.get("filename"),
+            "source_page_number": citation.get("source_page_number") or 1,
+            "global_page_number": citation.get("page_number"),
+        }
+
+    page_number = st.session_state.get("page_number", 1)
+    for page in st.session_state.get("ocr_pages", []) or []:
+        if page.get("page_number") == page_number:
+            return {
+                "document_index": page.get("document_index"),
+                "filename": page.get("filename"),
+                "source_page_number": page.get("source_page_number") or 1,
+                "global_page_number": page_number,
+            }
+    return None
+
+
+def get_uploaded_document(document_index: Any) -> dict[str, Any] | None:
+    if not isinstance(document_index, int):
+        return None
+    documents = st.session_state.get("uploaded_documents", []) or []
+    if document_index < 0 or document_index >= len(documents):
+        return None
+    return documents[document_index]
+
+
+def page_count_for_document(document: dict[str, Any]) -> int:
+    if is_pdf_file(document.get("filename"), document.get("content_type")):
+        pdf_document = fitz.open(stream=document["bytes"], filetype="pdf")
+        return pdf_document.page_count
+    return 1
+
+
+def citations_for_source_page(
+    citations: list[dict[str, Any]],
+    document_index: int | None,
+    source_page_number: int,
+) -> list[dict[str, Any]]:
+    return [
+        citation
+        for citation in citations
+        if citation.get("document_index") == document_index
+        and citation.get("source_page_number") == source_page_number
+    ]
+
+
 st.title("Claims Medical Adjudication Review")
 
 with st.sidebar:
@@ -247,7 +348,11 @@ with st.sidebar:
     api_base_url = st.text_input("API base URL", value=DEFAULT_API_BASE_URL)
     claim_type = st.selectbox("Claim type", ["reimbursement", "cashless"])
     claim_id = st.text_input("Claim ID", value="4000869819A")
-    uploaded_file = st.file_uploader("Upload claim PDF", type=["pdf"])
+    uploaded_files = st.file_uploader(
+        "Upload claim documents",
+        type=["pdf", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+    )
     run_clicked = st.button("Run OCR + Extraction", type="primary", use_container_width=True)
 
     st.divider()
@@ -259,11 +364,19 @@ with st.sidebar:
     )
 
 if run_clicked:
-    if uploaded_file is None:
-        st.error("Upload a PDF before running extraction.")
+    if not uploaded_files:
+        st.error("Upload at least one PDF/image before running extraction.")
     else:
-        pdf_bytes = uploaded_file.getvalue()
-        st.session_state["pdf_bytes"] = pdf_bytes
+        uploaded_documents = [
+            {
+                "document_index": index,
+                "filename": uploaded_file.name,
+                "content_type": uploaded_file.type or "application/octet-stream",
+                "bytes": uploaded_file.getvalue(),
+            }
+            for index, uploaded_file in enumerate(uploaded_files)
+        ]
+        st.session_state["uploaded_documents"] = uploaded_documents
         st.session_state["selected_field"] = None
         st.session_state["page_number"] = 1
 
@@ -273,9 +386,10 @@ if run_clicked:
                     api_base_url=api_base_url,
                     claim_type=claim_type,
                     claim_id=claim_id,
-                    uploaded_filename=uploaded_file.name,
-                    uploaded_file_type=uploaded_file.type or "application/pdf",
-                    pdf_bytes=pdf_bytes,
+                    uploaded_documents=uploaded_documents,
+                )
+                st.session_state["ocr_pages"] = (
+                    st.session_state["result"].get("ocr", {}).get("pages", [])
                 )
                 st.success("Extraction completed.")
             except requests.HTTPError as exc:
@@ -285,10 +399,10 @@ if run_clicked:
                 st.error(f"Could not call extraction API: {exc}")
 
 result = st.session_state.get("result")
-pdf_bytes = st.session_state.get("pdf_bytes")
+uploaded_documents = st.session_state.get("uploaded_documents", []) or []
 
 if not result:
-    st.info("Upload a PDF and run extraction to see document classification and extracted values.")
+    st.info("Upload PDFs/images and run extraction to see document classification and extracted values.")
     st.stop()
 
 extraction = result.get("extraction", {})
@@ -311,10 +425,13 @@ with left:
         st.dataframe(
             [
                 {
+                    "File": group.get("filename"),
+                    "File Page Start": group.get("start_source_page"),
+                    "File Page End": group.get("end_source_page"),
                     "Document Type": group.get("document_type"),
-                    "Start": group.get("start_page"),
-                    "End": group.get("end_page"),
-                    "Pages": ", ".join(str(page) for page in group.get("pages", [])),
+                    "Global Start": group.get("start_page"),
+                    "Global End": group.get("end_page"),
+                    "Global Pages": ", ".join(str(page) for page in group.get("pages", [])),
                     "Confidence": round(group.get("confidence", 0), 3),
                 }
                 for group in document_groups
@@ -359,52 +476,71 @@ with left:
         st.json(result)
 
 with right:
-    st.subheader("PDF Citation Viewer")
-    if not pdf_bytes:
-        st.warning("PDF bytes are not available. Re-upload and rerun extraction.")
+    st.subheader("Document Citation Viewer")
+    if not uploaded_documents:
+        st.warning("Uploaded document bytes are not available. Re-upload and rerun extraction.")
         st.stop()
 
-    document = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total_pdf_pages = document.page_count
-
     citations = selected_citations()
-    default_page = selected_page()
-    page_number = st.number_input(
-        "Page",
+    source_location = selected_source_location()
+    if source_location is None:
+        source_location = {
+            "document_index": 0,
+            "filename": uploaded_documents[0]["filename"],
+            "source_page_number": 1,
+            "global_page_number": 1,
+        }
+
+    document_index = source_location.get("document_index")
+    document = get_uploaded_document(document_index)
+    if document is None:
+        st.warning("The cited source document is not available. Re-upload and rerun extraction.")
+        st.stop()
+
+    total_document_pages = page_count_for_document(document)
+    source_page_number = st.number_input(
+        "Original file page",
         min_value=1,
-        max_value=max(total_pdf_pages, 1),
-        value=max(1, min(default_page, total_pdf_pages)),
+        max_value=max(total_document_pages, 1),
+        value=max(1, min(int(source_location.get("source_page_number") or 1), total_document_pages)),
         step=1,
     )
-    st.session_state["page_number"] = page_number
+    st.session_state["page_number"] = source_location.get("global_page_number") or selected_page()
     zoom = st.slider("Zoom", min_value=1.0, max_value=3.0, value=1.6, step=0.1)
+    visible_citations = citations_for_source_page(citations, document_index, source_page_number)
 
     selected = st.session_state.get("selected_field")
     if selected:
         st.markdown(f"**Selected field:** `{selected['path']}`")
         st.write(truncate(selected["value"], 180))
+        st.caption(
+            f"Source: `{document.get('filename')}`"
+            f", file page {source_page_number}"
+            f", global page {source_location.get('global_page_number') or '-'}"
+        )
         if citations:
             st.caption(
                 "Highlighting "
-                f"{sum(1 for citation in citations if citation.get('page_number') == page_number)} "
-                f"citation(s) on page {page_number}."
+                f"{len(visible_citations)} citation(s) on this original file page."
             )
             with st.expander("Citation text"):
-                for citation in citations:
-                    if citation.get("page_number") == page_number:
-                        st.write(
-                            f"Line {citation.get('line_index')}: "
-                            f"{citation.get('text', '')}"
-                        )
+                for citation in visible_citations:
+                    st.write(
+                        f"Global page {citation.get('page_number')}, "
+                        f"line {citation.get('line_index')}: "
+                        f"{citation.get('text', '')}"
+                    )
         else:
             st.info("The selected field does not have citation coordinates.")
     else:
-        st.info("Click `View` beside an extracted value to jump to its citation.")
+        st.info("Click `Go` beside an extracted value to jump to its citation.")
 
-    rendered_page = render_pdf_page(
-        pdf_bytes=pdf_bytes,
-        page_number=page_number,
-        citations=citations,
+    rendered_page = render_document_page(
+        document_bytes=document["bytes"],
+        filename=document.get("filename"),
+        content_type=document.get("content_type"),
+        source_page_number=source_page_number,
+        citations=visible_citations,
         zoom=zoom,
     )
     st.image(rendered_page, use_container_width=True)

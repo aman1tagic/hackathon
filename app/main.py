@@ -191,16 +191,25 @@ def _complete_page_classifications(
         page_number = page.get("page_number")
         if not isinstance(page_number, int):
             continue
+        page_metadata = {
+            "page_number": page_number,
+            "document_index": page.get("document_index"),
+            "filename": page.get("filename"),
+            "source_page_number": page.get("source_page_number"),
+        }
 
-        completed.append(
-            best_by_page.get(page_number)
-            or {
-                "page_number": page_number,
-                "document_type": "Unclassified",
-                "confidence": 0,
-                "reason": "No classification was returned for this OCR page.",
-            }
-        )
+        classification = best_by_page.get(page_number)
+        if classification:
+            completed.append({**classification, **page_metadata})
+        else:
+            completed.append(
+                {
+                    **page_metadata,
+                    "document_type": "Unclassified",
+                    "confidence": 0,
+                    "reason": "No classification was returned for this OCR page.",
+                }
+            )
 
     return completed
 
